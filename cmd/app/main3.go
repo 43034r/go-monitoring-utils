@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
+	"strconv" // Добавлен, если еще не был
 	"time"
 
 	prometheusClient "github.com/prometheus/client_golang/api"
@@ -18,7 +18,7 @@ import (
 	// НОВЫЕ ИМПОРТЫ для Prometheus remote_write
 	"github.com/golang/snappy"                // Для Snappy-сжатия
 	"github.com/prometheus/prometheus/prompb" // Для структур Prometheus remote_write (protobuf)
-	"google.golang.org/protobuf/proto"        // Для сериализации protobuf
+	"github.com/golang/protobuf/proto"        // <- ИСПРАВЛЕНО: используем старую библиотеку protobuf для совместимости с prompb
 )
 
 const (
@@ -61,7 +61,7 @@ func parseDuration(s string, defaultVal time.Duration, varName string) time.Dura
 func main() {
 	// Configure from environment variables
 	prometheusURL := getEnv("VM_PROM_URL", defaultPrometheusURL)
-	prometheusURLIn := getEnv("VM_PROM_URL_IN", defaultPrometheusURLIn)
+	prometheusURLIn := getEnv("VM_PROM_URL_IN", defaultPrometheusURLIn) // <- Этот prometheusURLIn теперь будет в области видимости
 	jobName := getEnv("JOB_NAME", defaultJobName)
 	targetValueFilter := getEnv("TARGET_VALUE", "") // Filter for a specific target, empty for all
 	metricPrefix := getEnv("METRIC_PREFIX", defaultMetricPrefix)
@@ -183,7 +183,7 @@ func main() {
 				currentQueryTime = rangeEnd // Move to next chunk
 				continue
 			}
-			currentQueryTime = rangeQueryTime
+			currentQueryTime = rangeEnd // <- ИСПРАВЛЕНО: было rangeQueryTime
 		}
 
 		if len(rawProbeSuccessData) == 0 {
@@ -217,13 +217,12 @@ func main() {
 		}
 
 		// --- Отправка метрик в VM_PROM_URL_IN ---
-		if prometheusURLIn != "" {
-			fmt.Printf("  Pushing metrics to %s...\n", prometetheusURLIn)
+		if prometheusURLIn != "" { // <- prometheusURLIn теперь точно в области видимости
+			fmt.Printf("  Pushing metrics to %s...\n", prometheusURLIn)
 			labels := map[string]string{
 				"job":    jobName,
 				"target": target,
 			}
-			// Теперь вызываем sendMetrics с новыми параметрами
 			sendMetrics(prometheusURLIn, metricPrefix, labels, map[string]float64{
 				"availability_percent":          availability,
 				"downtime_seconds_total":        downtimeSeconds,
@@ -238,14 +237,14 @@ func main() {
 
 // getTargetsForJob fetches all unique 'target' labels for a given 'job' from Prometheus/VictoriaMetrics.
 // If targetFilter is not empty, it returns only that target if found.
-// This function now uses api.LabelValues which queries the /api/v1/label/<label_name>/values endpoint,
-// AND includes the time range for the query.
+// This function uses api.LabelValues which queries the /api/v1/label/<label_name>/values endpoint,
+// and includes the time range for the query.
 func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, targetFilter string, startTime, endTime time.Time) ([]string, error) {
 	// Selector to filter probe_success metrics belonging to the specific job
 	selector := fmt.Sprintf(`{__name__="probe_success", job="%s"}`, job)
 
 	// Call the LabelValues method for the "target" label
-	// NOW INCLUDING startTime and endTime
+	// Includes startTime and endTime
 	values, warnings, err := api.LabelValues(ctx, "target", []string{selector}, startTime, endTime)
 	if err != nil {
 		return nil, fmt.Errorf("error querying label values for 'target' with selector '%s' in range %s to %s: %w", selector, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), err)
@@ -318,7 +317,8 @@ func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map
 	}
 
 	// Сериализуем WriteRequest в Protobuf
-	data, err := proto.Marshal(writeRequest)
+	// ИСПОЛЬЗУЕМ github.com/golang/protobuf/proto.Marshal для совместимости с prompb
+	data, err := proto.Marshal(writeRequest) // <- ИСПРАВЛЕНО
 	if err != nil {
 		fmt.Printf("Error marshaling Protobuf data: %v\n", err)
 		return
