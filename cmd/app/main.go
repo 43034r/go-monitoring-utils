@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
-	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/client_golang/api/prometheus"       // <--- Add this back for NewClient
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1" // This is for the API v1 client
 	"github.com/prometheus/common/model"
-
-	"github.com/prometheus/client_golang/api/prometheus"
 )
 
 const (
@@ -22,7 +20,7 @@ const (
 	// Default range for queries (e.g., for sum_over_time and increase)
 	// This should cover the full month effectively.
 	// We'll calculate it dynamically based on the start and end time of the month.
-	defaultQueryRange = "24h" 
+	defaultQueryRange = "24h"
 )
 
 // MetricResult represents a single calculated metric value for a specific time
