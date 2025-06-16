@@ -14,6 +14,11 @@ import (
 	prometheusClient "github.com/prometheus/client_golang/api"
 	prometheusV1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
+
+	// НОВЫЕ ИМПОРТЫ для Prometheus remote_write
+	"github.com/golang/snappy"                // Для Snappy-сжатия
+	"github.com/prometheus/prometheus/prompb" // Для структур Prometheus remote_write (protobuf)
+	"google.golang.org/protobuf/proto"        // Для сериализации protobuf
 )
 
 const (
@@ -118,7 +123,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// --- Получение списка таргетов. Теперь передаем startTime и endTime ---
+	// --- Получение списка таргетов ---
 	targets, err := getTargetsForJob(ctx, api, jobName, targetValueFilter, startTime, endTime)
 	if err != nil {
 		fmt.Printf("Error getting targets for job '%s': %v\n", jobName, err)
@@ -178,7 +183,7 @@ func main() {
 				currentQueryTime = rangeEnd // Move to next chunk
 				continue
 			}
-			currentQueryTime = rangeEnd
+			currentQueryTime = rangeQueryTime
 		}
 
 		if len(rawProbeSuccessData) == 0 {
@@ -213,11 +218,12 @@ func main() {
 
 		// --- Отправка метрик в VM_PROM_URL_IN ---
 		if prometheusURLIn != "" {
-			fmt.Printf("  Pushing metrics to %s...\n", prometheusURLIn)
+			fmt.Printf("  Pushing metrics to %s...\n", prometetheusURLIn)
 			labels := map[string]string{
 				"job":    jobName,
 				"target": target,
 			}
+			// Теперь вызываем sendMetrics с новыми параметрами
 			sendMetrics(prometheusURLIn, metricPrefix, labels, map[string]float64{
 				"availability_percent":          availability,
 				"downtime_seconds_total":        downtimeSeconds,
@@ -277,43 +283,61 @@ func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, tar
 }
 
 
-// sendMetrics pushes calculated metrics to a Prometheus Pushgateway-like endpoint (e.g., VictoriaMetrics /write).
-// This uses the InfluxDB line protocol, which VictoriaMetrics supports via /write endpoint.
+// sendMetrics pushes calculated metrics to a Prometheus remote_write compatible endpoint
+// using Prometheus remote_write protocol (Protobuf + Snappy compression).
 func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map[string]float64) {
-	var sb strings.Builder
-	timestamp := time.Now().UnixNano() // Use current time for the push
-
-	// Construct common labels string for InfluxDB Line Protocol
-	// Tags are key=value,key2=value2
-	var commonLabelsBuilder strings.Builder
-	firstLabel := true
-	for k, v := range commonLabels {
-		if !firstLabel {
-			commonLabelsBuilder.WriteString(",")
-		}
-		commonLabelsBuilder.WriteString(fmt.Sprintf("%s=%s", escapeInfluxQLTagKey(k), escapeInfluxQLTagValue(v)))
-		firstLabel = false
-	}
-	commonLabelsStr := commonLabelsBuilder.String()
+	writeRequest := &prompb.WriteRequest{}
 
 	for name, value := range metrics {
 		metricName := prefix + name
-		// InfluxDB line protocol format: <measurement>,<tag_key>=<tag_value> <field_key>=<field_value> <timestamp>
-		// Example: calc_be_availability_percent,job=blackbox,target=http://service-a.com value=99.99 1700000000000000000
-		sb.WriteString(fmt.Sprintf("%s", escapeInfluxQLMeasurement(metricName))) // Measurement
-		if commonLabelsStr != "" {
-			sb.WriteString(fmt.Sprintf(",%s", commonLabelsStr)) // Tags
+		
+		// Создаем лейблы для TimeSeries
+		// "__name__" - это специальный лейбл для имени метрики в Prometheus
+		labels := []prompb.Label{
+			{Name: "__name__", Value: metricName},
 		}
-		sb.WriteString(fmt.Sprintf(" value=%.4f %d\n", value, timestamp)) // Field and timestamp
+		// Добавляем общие лейблы (job, target)
+		for k, v := range commonLabels {
+			labels = append(labels, prompb.Label{Name: k, Value: v})
+		}
+		
+		// Создаем сэмпл
+		// Timestamp должен быть в миллисекундах Unix
+		sample := prompb.Sample{
+			Value:     value,
+			Timestamp: time.Now().UnixNano() / int64(time.Millisecond),
+		}
+
+		// Создаем TimeSeries, содержащий лейблы и сэмплы
+		ts := prompb.TimeSeries{
+			Labels:  labels,
+			Samples: []prompb.Sample{sample},
+		}
+
+		writeRequest.Timeseries = append(writeRequest.Timeseries, ts)
 	}
 
-	payload := sb.String()
-	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+	// Сериализуем WriteRequest в Protobuf
+	data, err := proto.Marshal(writeRequest)
+	if err != nil {
+		fmt.Printf("Error marshaling Protobuf data: %v\n", err)
+		return
+	}
+
+	// Сжимаем данные с помощью Snappy
+	compressedData := snappy.Encode(nil, data)
+
+	// Создаем HTTP POST запрос
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(compressedData)))
 	if err != nil {
 		fmt.Printf("Error creating HTTP request to send metrics: %v\n", err)
 		return
 	}
-	req.Header.Set("Content-Type", "text/plain") // Content-Type for InfluxDB line protocol
+
+	// Устанавливаем правильные заголовки для Prometheus remote_write
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Content-Encoding", "snappy")
+	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0") // Рекомендуемый заголовок
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -331,28 +355,8 @@ func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map
 	}
 }
 
-// escapeInfluxQLMeasurement escapes special characters for InfluxDB Line Protocol measurement names.
-func escapeInfluxQLMeasurement(s string) string {
-    s = strings.ReplaceAll(s, ",", "\\,")
-    s = strings.ReplaceAll(s, " ", "\\ ")
-    return s
-}
-
-// escapeInfluxQLTagKey escapes special characters for InfluxDB Line Protocol tag keys.
-func escapeInfluxQLTagKey(s string) string {
-    s = strings.ReplaceAll(s, ",", "\\,")
-    s = strings.ReplaceAll(s, " ", "\\ ")
-    s = strings.ReplaceAll(s, "=", "\\=")
-    return s
-}
-
-// escapeInfluxQLTagValue escapes special characters for InfluxDB Line Protocol tag values.
-func escapeInfluxQLTagValue(s string) string {
-    s = strings.ReplaceAll(s, ",", "\\,")
-    s = strings.ReplaceAll(s, " ", "\\ ")
-    s = strings.ReplaceAll(s, "\"", "\\\"") // Escape double quotes within values
-    return s
-}
+// Вспомогательные функции для форматирования метрик и времени (без изменений)
+// ... (оставшиеся функции calculateAvailability, calculateDowntime, calculateNumIncidents, calculateMTTR, formatDuration, join остаются БЕЗ ИЗМЕНЕНИЙ)
 
 // calculateAvailability calculates the overall availability percentage.
 // It counts successful probes and divides by total probes.
