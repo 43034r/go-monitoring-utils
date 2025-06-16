@@ -6,8 +6,13 @@ import (
 	"os"
 	"time"
 
+<<<<<<< HEAD
 	"github.com/prometheus/client_golang/api/prometheus"       // <--- Add this back for NewClient
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1" // This is for the API v1 client
+=======
+	prometheusClient "github.com/prometheus/client_golang/api"        // Correct import for NewClient and Config
+	prometheusV1 "github.com/prometheus/client_golang/api/prometheus/v1" // Correct import for v1 API
+>>>>>>> b63beca2a6a36e103c2e2278a7b21363f487131b
 	"github.com/prometheus/common/model"
 )
 
@@ -17,10 +22,14 @@ const (
 	defaultTargetValue       = "http://example.com"
 	defaultAggregationPeriod = 1 * time.Minute
 	defaultQueryStep         = 2 * time.Hour
+<<<<<<< HEAD
 	// Default range for queries (e.g., for sum_over_time and increase)
 	// This should cover the full month effectively.
 	// We'll calculate it dynamically based on the start and end time of the month.
 	defaultQueryRange = "24h"
+=======
+	defaultQueryRange        = "24h"
+>>>>>>> b63beca2a6a36e103c2e2278a7b21363f487131b
 )
 
 // MetricResult represents a single calculated metric value for a specific time
@@ -57,15 +66,14 @@ func main() {
 	jobName := getEnv("JOB_NAME", defaultJobName)
 	targetValue := getEnv("TARGET_VALUE", defaultTargetValue)
 
-	aggregationPeriodStr := getEnv("AGGREGATION_PERIOD", "1m") // e.g., "1m", "5m"
+	aggregationPeriodStr := getEnv("AGGREGATION_PERIOD", "1m")
 	aggregationPeriod := parseDuration(aggregationPeriodStr, defaultAggregationPeriod, "AGGREGATION_PERIOD")
 
-	queryStepStr := getEnv("QUERY_STEP", "2h") // e.g., "1h", "2h"
+	queryStepStr := getEnv("QUERY_STEP", "2h")
 	queryStep := parseDuration(queryStepStr, defaultQueryStep, "QUERY_STEP")
 
-	queryRangeStr := getEnv("QUERY_RANGE", defaultQueryRange) // e.g., "24h", "7d"
-	// We parse this for validation and later use its string representation in queries.
-	queryRangeDuration := parseDuration(queryRangeStr, 24*time.Hour, "QUERY_RANGE") // Not directly used as time.Duration in range queries here
+	queryRangeStr := getEnv("QUERY_RANGE", defaultQueryRange)
+	queryRangeDuration := parseDuration(queryRangeStr, 24*time.Hour, "QUERY_RANGE")
 
 	fmt.Printf("Connecting to VictoriaMetrics at: %s\n", prometheusURL)
 	fmt.Printf("Monitoring target: job=\"%s\", target=\"%s\"\n", jobName, targetValue)
@@ -73,7 +81,8 @@ func main() {
 	fmt.Printf("Query step (interval for each request): %s\n", queryStep)
 	fmt.Printf("Query range for calculations (e.g., for sum_over_time): %s\n", queryRangeStr)
 
-	client, err := prometheus.NewClient(prometheus.Config{
+	// Correctly using aliased import for NewClient and Config
+	client, err := prometheusClient.NewClient(prometheusClient.Config{
 		Address: prometheusURL,
 	})
 	if err != nil {
@@ -81,17 +90,16 @@ func main() {
 		return
 	}
 
-	api := v1.NewAPI(client)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute) // Increased timeout
+	// Using the aliased v1 API client
+	api := prometheusV1.NewAPI(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	// Calculate start and end times for the last month
 	endTime := time.Now()
-	startTime := endTime.AddDate(0, -1, 0) // One month ago from now
+	startTime := endTime.AddDate(0, -1, 0)
 
 	fmt.Printf("\nCalculating metrics for the period: %s to %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 
-	// Maps to store aggregated results for each metric type
 	availabilityResults := make(map[time.Time]float64)
 	downtimeSecondsResults := make(map[time.Time]float64)
 	mttrResults := make(map[time.Time]float64)
@@ -104,9 +112,6 @@ func main() {
 			rangeEnd = endTime
 		}
 
-		// Calculate __interval and __range for the current sub-query window
-		// __interval will be aggregationPeriod
-		// __range will be the duration of the current query step or queryRangeDuration if it's smaller
 		effectiveInterval := aggregationPeriod.String()
 		effectiveRange := (rangeEnd.Sub(currentQueryTime)).String()
 		if queryRangeDuration > 0 && queryRangeDuration < (rangeEnd.Sub(currentQueryTime)) {
@@ -115,32 +120,19 @@ func main() {
 
 		fmt.Printf("\n--- Querying slice: %s to %s ---\n", currentQueryTime.Format(time.RFC3339), rangeEnd.Format(time.RFC3339))
 
-		// 1. Доступность (Availability)
-		// avg_over_time(probe_success{job="$job", target="$target"}[$__interval]) * 100
 		availabilityQuery := fmt.Sprintf(`avg_over_time(probe_success{job="%s", target="%s"}[%s]) * 100`, jobName, targetValue, effectiveInterval)
 		fmt.Printf("Running Availability Query: %s\n", availabilityQuery)
 		queryAndStore(api, ctx, availabilityQuery, currentQueryTime, rangeEnd, aggregationPeriod, availabilityResults)
 
-		// 2. Простой системы (Downtime) - Total seconds of downtime
-		// sum_over_time((1 - probe_success{job="$job", target="$target"})[$__range:])
 		downtimeQuery := fmt.Sprintf(`sum_over_time((1 - probe_success{job="%s", target="%s"})[%s:])`, jobName, targetValue, effectiveRange)
 		fmt.Printf("Running Downtime Query: %s\n", downtimeQuery)
 		queryAndStore(api, ctx, downtimeQuery, currentQueryTime, rangeEnd, aggregationPeriod, downtimeSecondsResults)
 
-		// 3. Среднее время восстановления (Mean Time To Recovery - MTTR)
-		// sum_over_time((1 - probe_success{job="$job", target="$target"}) [$__range:]) / (sum(increase((probe_success{job="$job", target="$target"} == bool 0)[$__range:])) + 0.00000001)
-		// Prometheus `increase` counts events, so `increase(probe_success == bool 0)` counts transitions from good to bad.
-		// We'll calculate the numerator (total downtime) and denominator (number of incidents) separately to be robust,
-		// and then combine them in the final output. Or, we can directly use the PromQL expression.
-		// Using the direct PromQL for simplicity as per the request.
 		mttrQuery := fmt.Sprintf(`sum_over_time((1 - probe_success{job="%s", target="%s"})[%s:]) / (sum(increase((probe_success{job="%s", target="%s"} == bool 0)[%s:])) + 0.00000001)`,
 			jobName, targetValue, effectiveRange, jobName, targetValue, effectiveRange)
 		fmt.Printf("Running MTTR Query: %s\n", mttrQuery)
 		queryAndStore(api, ctx, mttrQuery, currentQueryTime, rangeEnd, aggregationPeriod, mttrResults)
 
-		// 4. Простоев (Number of Incidents)
-		// sum(increase((probe_success{job="$job", target="$target"} == bool 0)[$__range:]))
-		// This counts how many times probe_success changed from 1 to 0 (i.e., went down).
 		incidentsQuery := fmt.Sprintf(`sum(increase((probe_success{job="%s", target="%s"} == bool 0)[%s:]))`, jobName, targetValue, effectiveRange)
 		fmt.Printf("Running Incidents Query: %s\n", incidentsQuery)
 		queryAndStore(api, ctx, incidentsQuery, currentQueryTime, rangeEnd, aggregationPeriod, incidentsResults)
@@ -159,8 +151,8 @@ func main() {
 }
 
 // queryAndStore performs a Prometheus range query and stores the results in the provided map
-func queryAndStore(api v1.API, ctx context.Context, query string, start, end time.Time, step time.Duration, results map[time.Time]float64) {
-	r := v1.Range{
+func queryAndStore(api prometheusV1.API, ctx context.Context, query string, start, end time.Time, step time.Duration, results map[time.Time]float64) {
+	r := prometheusV1.Range{
 		Start: start,
 		End:   end,
 		Step:  step,
@@ -203,7 +195,7 @@ func printSortedResults(metricName string, results map[time.Time]float64) {
 	for i := 0; i < len(sortedTimestamps); i++ {
 		for j := i + 1; j < len(sortedTimestamps); j++ {
 			if sortedTimestamps[j].Before(sortedTimestamps[i]) {
-				sortedTimestamps[i], sortedTimestamps[j] = sortedTimistedTimestamps[j], sortedTimestamps[i]
+				sortedTimestamps[i], sortedTimestamps[j] = sortedTimestamps[j], sortedTimestamps[i]
 			}
 		}
 	}
