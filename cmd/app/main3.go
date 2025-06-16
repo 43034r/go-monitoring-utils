@@ -118,18 +118,18 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	// --- Получение списка таргетов ---
-	targets, err := getTargetsForJob(ctx, api, jobName, targetValueFilter)
+	// --- Получение списка таргетов. Теперь передаем startTime и endTime ---
+	targets, err := getTargetsForJob(ctx, api, jobName, targetValueFilter, startTime, endTime)
 	if err != nil {
 		fmt.Printf("Error getting targets for job '%s': %v\n", jobName, err)
 		return
 	}
 	if len(targets) == 0 {
-		fmt.Printf("No targets found for job '%s' (or filtered target '%s'). Exiting.\n", jobName, targetValueFilter)
+		fmt.Printf("No targets found for job '%s' (or filtered target '%s') within the period %s to %s. Exiting.\n", jobName, targetValueFilter, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 		return
 	}
 
-	fmt.Printf("\nFound %d target(s) for job '%s' (after filter): %v\n", len(targets), jobName, targets)
+	fmt.Printf("\nFound %d target(s) for job '%s' (after filter) within the period: %v\n", len(targets), jobName, targets)
 
 	// --- Перебор таргетов и расчет метрик для каждого ---
 	for _, target := range targets {
@@ -233,17 +233,16 @@ func main() {
 // getTargetsForJob fetches all unique 'target' labels for a given 'job' from Prometheus/VictoriaMetrics.
 // If targetFilter is not empty, it returns only that target if found.
 // This function now uses api.LabelValues which queries the /api/v1/label/<label_name>/values endpoint,
-// which is more reliable for getting label values in VictoriaMetrics than raw PromQL label_values().
-func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, targetFilter string) ([]string, error) {
+// AND includes the time range for the query.
+func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, targetFilter string, startTime, endTime time.Time) ([]string, error) {
 	// Selector to filter probe_success metrics belonging to the specific job
-	// This matches the format expected by the `matches` argument of LabelValues
 	selector := fmt.Sprintf(`{__name__="probe_success", job="%s"}`, job)
 
 	// Call the LabelValues method for the "target" label
-	// It returns a slice of model.LabelValue
-	values, warnings, err := api.LabelValues(ctx, "target", []string{selector})
+	// NOW INCLUDING startTime and endTime
+	values, warnings, err := api.LabelValues(ctx, "target", []string{selector}, startTime, endTime)
 	if err != nil {
-		return nil, fmt.Errorf("error querying label values for 'target' with selector '%s': %w", selector, err)
+		return nil, fmt.Errorf("error querying label values for 'target' with selector '%s' in range %s to %s: %w", selector, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), err)
 	}
 	if len(warnings) > 0 {
 		fmt.Printf("Warnings from LabelValues query: %v\n", warnings)
@@ -274,7 +273,7 @@ func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, tar
 	// If no filter, return all unique targets.
 	// LabelValues should typically return unique values already, but sorting is good practice.
 	sort.Strings(targets)
-	return targets, nil // No need for explicit unique check via map, LabelValues should handle it
+	return targets, nil
 }
 
 
