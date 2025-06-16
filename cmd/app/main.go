@@ -4,24 +4,24 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
-	prometheusClient "github.com/prometheus/client_golang/api"           // Correct import for NewClient and Config
-	prometheusV1 "github.com/prometheus/client_golang/api/prometheus/v1" // Correct import for v1 API
+	prometheusClient "github.com/prometheus/client_golang/api"
+	prometheusV1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 )
 
 const (
-	defaultPrometheusURL     = "http://localhost:8428" // Default VictoriaMetrics URL
+	defaultPrometheusURL     = "http://localhost:8428"
 	defaultJobName           = "blackbox"
 	defaultTargetValue       = "http://example.com"
-	defaultAggregationPeriod = 1 * time.Minute
-	defaultQueryStep         = 2 * time.Hour
-	defaultQueryRange        = "24h"
+	defaultScrapeInterval    = 1 * time.Minute // Assuming blackbox_exporter scrape interval is 1 minute
+	defaultQueryStep         = 12 * time.Hour  // Fetch data in 12-hour chunks
 )
 
-// MetricResult represents a single calculated metric value for a specific time
-type MetricResult struct {
+// SamplePair represents a single time series data point (timestamp and value)
+type SamplePair struct {
 	Timestamp time.Time
 	Value     float64
 }
@@ -54,22 +54,17 @@ func main() {
 	jobName := getEnv("JOB_NAME", defaultJobName)
 	targetValue := getEnv("TARGET_VALUE", defaultTargetValue)
 
-	aggregationPeriodStr := getEnv("AGGREGATION_PERIOD", "1m")
-	aggregationPeriod := parseDuration(aggregationPeriodStr, defaultAggregationPeriod, "AGGREGATION_PERIOD")
+	scrapeIntervalStr := getEnv("SCRAPE_INTERVAL", "1m") // This will be the 'step' for our raw data query
+	scrapeInterval := parseDuration(scrapeIntervalStr, defaultScrapeInterval, "SCRAPE_INTERVAL")
 
-	queryStepStr := getEnv("QUERY_STEP", "2h")
+	queryStepStr := getEnv("QUERY_STEP", "12h") // Max range for a single API query
 	queryStep := parseDuration(queryStepStr, defaultQueryStep, "QUERY_STEP")
-
-	queryRangeStr := getEnv("QUERY_RANGE", defaultQueryRange)
-	queryRangeDuration := parseDuration(queryRangeStr, 24*time.Hour, "QUERY_RANGE")
 
 	fmt.Printf("Connecting to VictoriaMetrics at: %s\n", prometheusURL)
 	fmt.Printf("Monitoring target: job=\"%s\", target=\"%s\"\n", jobName, targetValue)
-	fmt.Printf("Aggregation period: %s\n", aggregationPeriod)
-	fmt.Printf("Query step (interval for each request): %s\n", queryStep)
-	fmt.Printf("Query range for calculations (e.g., for sum_over_time): %s\n", queryRangeStr)
+	fmt.Printf("Assumed scrape interval (query step for raw data): %s\n", scrapeInterval)
+	fmt.Printf("Query chunk size: %s\n", queryStep)
 
-	// Correctly using aliased import for NewClient and Config
 	client, err := prometheusClient.NewClient(prometheusClient.Config{
 		Address: prometheusURL,
 	})
@@ -78,20 +73,17 @@ func main() {
 		return
 	}
 
-	// Using the aliased v1 API client
 	api := prometheusV1.NewAPI(client)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // Increased timeout for potentially large data fetches
 	defer cancel()
 
+	// Calculate start and end times for the last month
 	endTime := time.Now()
-	startTime := endTime.AddDate(0, -1, 0)
+	startTime := endTime.AddDate(0, -1, 0) // One month ago from now
 
-	fmt.Printf("\nCalculating metrics for the period: %s to %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	fmt.Printf("\nCollecting raw probe_success data for the period: %s to %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 
-	availabilityResults := make(map[time.Time]float64)
-	downtimeSecondsResults := make(map[time.Time]float64)
-	mttrResults := make(map[time.Time]float64)
-	incidentsResults := make(map[time.Time]float64)
+	var rawProbeSuccessData []SamplePair
 
 	currentQueryTime := startTime
 	for currentQueryTime.Before(endTime) {
@@ -100,96 +92,239 @@ func main() {
 			rangeEnd = endTime
 		}
 
-		effectiveInterval := aggregationPeriod.String()
-		effectiveRange := (rangeEnd.Sub(currentQueryTime)).String()
-		if queryRangeDuration > 0 && queryRangeDuration < (rangeEnd.Sub(currentQueryTime)) {
-			effectiveRange = queryRangeDuration.String()
+		query := fmt.Sprintf(`probe_success{job="%s", target="%s"}`, jobName, targetValue)
+		fmt.Printf("Fetching raw data chunk: %s to %s with step %s for query: %s\n",
+			currentQueryTime.Format(time.RFC3339), rangeEnd.Format(time.RFC3339), scrapeInterval, query)
+
+		r := prometheusV1.Range{
+			Start: currentQueryTime,
+			End:   rangeEnd,
+			Step:  scrapeInterval,
 		}
 
-		fmt.Printf("\n--- Querying slice: %s to %s ---\n", currentQueryTime.Format(time.RFC3339), rangeEnd.Format(time.RFC3339))
+		value, warnings, err := api.QueryRange(ctx, query, r)
+		if err != nil {
+			fmt.Printf("Error querying Prometheus for raw data: %v\n", err)
+			return
+		}
+		if len(warnings) > 0 {
+			fmt.Printf("Prometheus warnings for raw data query: %v\n", warnings)
+		}
 
-		availabilityQuery := fmt.Sprintf(`avg_over_time(probe_success{job="%s", target="%s"}[%s]) * 100`, jobName, targetValue, effectiveInterval)
-		fmt.Printf("Running Availability Query: %s\n", availabilityQuery)
-		queryAndStore(api, ctx, availabilityQuery, currentQueryTime, rangeEnd, aggregationPeriod, availabilityResults)
-
-		downtimeQuery := fmt.Sprintf(`sum_over_time((1 - probe_success{job="%s", target="%s"})[%s:])`, jobName, targetValue, effectiveRange)
-		fmt.Printf("Running Downtime Query: %s\n", downtimeQuery)
-		queryAndStore(api, ctx, downtimeQuery, currentQueryTime, rangeEnd, aggregationPeriod, downtimeSecondsResults)
-
-		mttrQuery := fmt.Sprintf(`sum_over_time((1 - probe_success{job="%s", target="%s"})[%s:]) / (sum(increase((probe_success{job="%s", target="%s"} == bool 0)[%s:])) + 0.00000001)`,
-			jobName, targetValue, effectiveRange, jobName, targetValue, effectiveRange)
-		fmt.Printf("Running MTTR Query: %s\n", mttrQuery)
-		queryAndStore(api, ctx, mttrQuery, currentQueryTime, rangeEnd, aggregationPeriod, mttrResults)
-
-		incidentsQuery := fmt.Sprintf(`sum(increase((probe_success{job="%s", target="%s"} == bool 0)[%s:]))`, jobName, targetValue, effectiveRange)
-		fmt.Printf("Running Incidents Query: %s\n", incidentsQuery)
-		queryAndStore(api, ctx, incidentsQuery, currentQueryTime, rangeEnd, aggregationPeriod, incidentsResults)
+		if matrix, ok := value.(model.Matrix); ok {
+			for _, series := range matrix {
+				for _, sample := range series.Values {
+					rawProbeSuccessData = append(rawProbeSuccessData, SamplePair{
+						Timestamp: sample.Timestamp.Time(),
+						Value:     float64(sample.Value),
+					})
+				}
+			}
+		} else {
+			fmt.Println("Unexpected raw data query result format. Expected a Matrix.")
+			return
+		}
 
 		currentQueryTime = rangeEnd
 	}
 
-	fmt.Println("\n--- Final Aggregated Results (Sorted by Time) ---")
-
-	printSortedResults("Доступность (%)", availabilityResults)
-	printSortedResults("Простой системы (секунды)", downtimeSecondsResults)
-	printSortedResults("Среднее время восстановления (секунды)", mttrResults)
-	printSortedResults("Количество простоев", incidentsResults)
-
-	fmt.Println("\n--- End of Results ---")
-}
-
-// queryAndStore performs a Prometheus range query and stores the results in the provided map
-func queryAndStore(api prometheusV1.API, ctx context.Context, query string, start, end time.Time, step time.Duration, results map[time.Time]float64) {
-	r := prometheusV1.Range{
-		Start: start,
-		End:   end,
-		Step:  step,
-	}
-
-	value, warnings, err := api.QueryRange(ctx, query, r)
-	if err != nil {
-		fmt.Printf("Error querying Prometheus for '%s': %v\n", query, err)
+	if len(rawProbeSuccessData) == 0 {
+		fmt.Println("\nNo raw probe_success data collected for the specified period and target. Cannot calculate metrics.")
 		return
 	}
-	if len(warnings) > 0 {
-		fmt.Printf("Prometheus warnings for '%s': %v\n", query, warnings)
-	}
 
-	if matrix, ok := value.(model.Matrix); ok {
-		for _, series := range matrix {
-			for _, sample := range series.Values {
-				roundedTime := sample.Timestamp.Time().Round(step)
-				results[roundedTime] = float64(sample.Value)
-			}
-		}
+	// Sort raw data by timestamp to ensure correct processing
+	sort.Slice(rawProbeSuccessData, func(i, j int) bool {
+		return rawProbeSuccessData[i].Timestamp.Before(rawProbeSuccessData[j].Timestamp)
+	})
+
+	fmt.Printf("\nCollected %d raw data points.\n", len(rawProbeSuccessData))
+
+	fmt.Println("\n--- Calculating Aggregated Metrics for the Entire Period ---")
+
+	// Calculate Availability
+	availability := calculateAvailability(rawProbeSuccessData)
+	fmt.Printf("1. Доступность (Availability): %.4f%%\n", availability)
+
+	// Calculate Downtime
+	downtimeSeconds := calculateDowntime(rawProbeSuccessData, scrapeInterval)
+	fmt.Printf("2. Простой системы (Total Downtime): %.2f seconds (approx. %s)\n", downtimeSeconds, formatDuration(time.Duration(downtimeSeconds)*time.Second))
+
+	// Calculate Number of Incidents
+	numIncidents := calculateNumIncidents(rawProbeSuccessData)
+	fmt.Printf("3. Количество простоев (Number of Incidents): %d\n", numIncidents)
+
+	// Calculate MTTR (Mean Time To Recovery)
+	mttrSeconds := calculateMTTR(rawProbeSuccessData, scrapeInterval)
+	if mttrSeconds < 0 {
+		fmt.Printf("4. Среднее время восстановления (MTTR): Not applicable (no incidents or recovery)\n")
 	} else {
-		fmt.Printf("Unexpected query result format for '%s'. Expected a Matrix.\n", query)
+		fmt.Printf("4. Среднее время восстановления (MTTR): %.2f seconds (approx. %s)\n", mttrSeconds, formatDuration(time.Duration(mttrSeconds)*time.Second))
 	}
+
+	fmt.Println("\n--- End of Aggregated Results ---")
+
+	// Optional: Print raw data for debugging/verification
+	// fmt.Println("\n--- Raw Probe Success Data (first 100 points) ---")
+	// for i, dp := range rawProbeSuccessData {
+	// 	if i >= 100 {
+	// 		break
+	// 	}
+	// 	fmt.Printf("Time: %s, Value: %.0f\n", dp.Timestamp.Format("2006-01-02 15:04:05"), dp.Value)
+	// }
+	// fmt.Println("\n--- End of Raw Data ---")
 }
 
-// printSortedResults prints the results map, sorted by timestamp
-func printSortedResults(metricName string, results map[time.Time]float64) {
-	if len(results) == 0 {
-		fmt.Printf("\n--- %s ---\n", metricName)
-		fmt.Println("No data found.")
-		return
+// calculateAvailability calculates the overall availability percentage.
+// It counts successful probes and divides by total probes.
+func calculateAvailability(data []SamplePair) float64 {
+	if len(data) == 0 {
+		return 0.0
 	}
 
-	sortedTimestamps := make([]time.Time, 0, len(results))
-	for ts := range results {
-		sortedTimestamps = append(sortedTimestamps, ts)
+	totalProbes := len(data)
+	successfulProbes := 0
+	for _, dp := range data {
+		if dp.Value == 1.0 { // probe_success == 1 means success
+			successfulProbes++
+		}
 	}
-	// Sort the slice of timestamps
-	for i := 0; i < len(sortedTimestamps); i++ {
-		for j := i + 1; j < len(sortedTimestamps); j++ {
-			if sortedTimestamps[j].Before(sortedTimestamps[i]) {
-				sortedTimestamps[i], sortedTimestamps[j] = sortedTimestamps[j], sortedTimestamps[i]
+	return (float64(successfulProbes) / float64(totalProbes)) * 100.0
+}
+
+// calculateDowntime calculates the total time in seconds the system was down.
+// It sums up the duration of each "0" (failure) probe_success sample.
+func calculateDowntime(data []SamplePair, scrapeInterval time.Duration) float64 {
+	if len(data) == 0 {
+		return 0.0
+	}
+
+	totalDowntimeSeconds := 0.0
+	for _, dp := range data {
+		if dp.Value == 0.0 { // probe_success == 0 means failure/downtime
+			totalDowntimeSeconds += scrapeInterval.Seconds()
+		}
+	}
+	return totalDowntimeSeconds
+}
+
+// calculateNumIncidents counts the number of distinct incidents (transitions from 1 to 0).
+func calculateNumIncidents(data []SamplePair) int {
+	if len(data) < 2 {
+		// Cannot determine transitions with less than 2 data points
+		return 0
+	}
+
+	incidents := 0
+	// Assume initial state is up if first probe is 1, otherwise it might be already down.
+	// For incident counting, we care about 'falling'
+	wasUp := data[0].Value == 1.0
+
+	for i := 1; i < len(data); i++ {
+		// If it was up and now it's down, it's a new incident
+		if wasUp && data[i].Value == 0.0 {
+			incidents++
+		}
+		// Update wasUp for the next iteration
+		wasUp = data[i].Value == 1.0
+	}
+	return incidents
+}
+
+// calculateMTTR calculates Mean Time To Recovery (MTTR).
+// It identifies downtime periods and averages their durations.
+// Returns -1 if no incidents occurred.
+func calculateMTTR(data []SamplePair, scrapeInterval time.Duration) float64 {
+	if len(data) == 0 {
+		return -1.0
+	}
+
+	var downtimeDurations []float64 // Stores duration of each incident in seconds
+	inDowntime := false
+	downtimeStart := time.Time{}
+
+	for i, dp := range data {
+		if dp.Value == 0.0 { // Currently down
+			if !inDowntime {
+				// Start of a new downtime period
+				inDowntime = true
+				downtimeStart = dp.Timestamp // Mark the start of this downtime incident
 			}
+			// If already in downtime, continue counting
+		} else { // dp.Value == 1.0 (Currently up)
+			if inDowntime {
+				// End of a downtime period, calculate duration
+				downtimeEnd := dp.Timestamp // Recovery happened at this point
+				duration := downtimeEnd.Sub(downtimeStart).Seconds()
+				downtimeDurations = append(downtations, duration)
+				inDowntime = false
+			}
+			// If already up, continue being up
+		}
+
+		// Handle case where downtime extends to the very end of the data
+		if inDowntime && i == len(data)-1 {
+			// If we are still in downtime at the end of data,
+			// count the duration up to the last timestamp.
+			duration := data[i].Timestamp.Sub(downtimeStart).Seconds() + scrapeInterval.Seconds() // Add one interval for the last down probe
+			downtimeDurations = append(downtimeDurations, duration)
 		}
 	}
 
-	fmt.Printf("\n--- %s ---\n", metricName)
-	for _, ts := range sortedTimestamps {
-		fmt.Printf("Time: %s, Value: %.4f\n", ts.Format("2006-01-02 15:04:05"), results[ts])
+	if len(downtimeDurations) == 0 {
+		return -1.0 // No incidents found or recovered
 	}
+
+	totalDowntimeDuration := 0.0
+	for _, d := range downtimeDurations {
+		totalDowntimeDuration += d
+	}
+
+	return totalDowntimeDuration / float64(len(downtimeDurations))
+}
+
+// formatDuration converts a time.Duration to a human-readable string.
+func formatDuration(d time.Duration) string {
+	days := int(d.Hours() / 24)
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	parts := []string{}
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if seconds > 0 || len(parts) == 0 { // Always show seconds if duration is less than a minute
+		parts = append(parts, fmt.Sprintf("%ds", seconds))
+	}
+	return fmt.Sprintf("%s", join(parts, " "))
+}
+
+// Helper to join string slice with a separator
+func join(elems []string, sep string) string {
+	switch len(elems) {
+	case 0:
+		return ""
+	case 1:
+		return elems[0]
+	}
+	n := len(sep) * (len(elems) - 1)
+	for i := 0; i < len(elems); i++ {
+		n += len(elems[i])
+	}
+
+	var b []byte
+	b = make([]byte, 0, n)
+	b = append(b, elems[0]...)
+	for _, s := range elems[1:] {
+		b = append(b, sep...)
+		b = append(b, s...)
+	}
+	return string(b)
 }
