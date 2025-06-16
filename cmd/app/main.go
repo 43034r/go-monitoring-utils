@@ -220,4 +220,114 @@ func calculateNumIncidents(data []SamplePair) int {
 	incidents := 0
 	// Assume initial state is up if first probe is 1, otherwise it might be already down.
 	// For incident counting, we care about 'falling'
-	wasUp :=
+	wasUp := data[0].Value == 1.0
+
+	for i := 1; i < len(data); i++ {
+		// If it was up and now it's down, it's a new incident
+		if wasUp && data[i].Value == 0.0 {
+			incidents++
+		}
+		// Update wasUp for the next iteration
+		wasUp = data[i].Value == 1.0
+	}
+	return incidents
+}
+
+// calculateMTTR calculates Mean Time To Recovery (MTTR).
+// It identifies downtime periods and averages their durations.
+// Returns -1 if no incidents occurred.
+func calculateMTTR(data []SamplePair, scrapeInterval time.Duration) float64 {
+	if len(data) == 0 {
+		return -1.0
+	}
+
+	var downtimeDurations []float64 // Stores duration of each incident in seconds
+	inDowntime := false
+	downtimeStart := time.Time{}
+
+	for i, dp := range data {
+		if dp.Value == 0.0 { // Currently down
+			if !inDowntime {
+				// Start of a new downtime period
+				inDowntime = true
+				downtimeStart = dp.Timestamp // Mark the start of this downtime incident
+			}
+			// If already in downtime, continue counting
+		} else { // dp.Value == 1.0 (Currently up)
+			if inDowntime {
+				// End of a downtime period, calculate duration
+				downtimeEnd := dp.Timestamp // Recovery happened at this point
+				duration := downtimeEnd.Sub(downtimeStart).Seconds()
+				downtimeDurations = append(downtimeDurations, duration)
+				inDowntime = false
+			}
+			// If already up, continue being up
+		}
+
+		// Handle case where downtime extends to the very end of the data
+		// This ensures that if the service is down at the end of the monitored period,
+		// that downtime segment is still counted.
+		// Only add if it was an actual downtime segment, not if it was already up.
+		if inDowntime && i == len(data)-1 {
+			duration := data[i].Timestamp.Sub(downtimeStart).Seconds() + scrapeInterval.Seconds() // Add one interval for the last down probe
+			downtimeDurations = append(downtimeDurations, duration)
+		}
+	} // <-- Missing closing brace for the 'for' loop was likely here, now it's correctly placed
+
+	if len(downtimeDurations) == 0 {
+		return -1.0 // No incidents found or recovered
+	}
+
+	totalDowntimeDuration := 0.0
+	for _, d := range downtimeDurations {
+		totalDowntimeDuration += d
+	}
+
+	return totalDowntimeDuration / float64(len(downtimeDurations))
+} // <-- Missing closing brace for the 'func' was likely here, now it's correctly placed
+
+// formatDuration converts a time.Duration to a human-readable string.
+func formatDuration(d time.Duration) string {
+	days := int(d.Hours() / 24)
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+	seconds := int(d.Seconds()) % 60
+
+	parts := []string{}
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if seconds > 0 || len(parts) == 0 { // Always show seconds if duration is less than a minute
+		parts = append(parts, fmt.Sprintf("%ds", seconds))
+	}
+	return fmt.Sprintf("%s", join(parts, " "))
+}
+
+// Helper to join string slice with a separator
+func join(elems []string, sep string) string {
+	switch len(elems) {
+	case 0:
+		return ""
+	case 1:
+		return elems[0]
+	}
+	n := len(sep) * (len(elems) - 1)
+	for i := 0; i < len(elems); i++ {
+		n += len(elems[i])
+	}
+
+	var b []byte
+	b = make([]byte, 0, n)
+	b = append(b, elems[0]...)
+	for _, s := range elems[1:] {
+		b = append(b, sep...)
+		b = append(b, s...)
+	}
+	return string(b)
+}
