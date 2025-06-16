@@ -67,7 +67,7 @@ func main() {
 	queryStepStr := getEnv("QUERY_STEP", "12h")
 	queryStep := parseDuration(queryStepStr, defaultQueryStep, "QUERY_STEP")
 
-	// --- Определение периода расчета (аналогично main2.go) ---
+	// --- Определение периода расчета ---
 	targetMonthStr := getEnv("TARGET_MONTH", "")
 	targetYearStr := getEnv("TARGET_YEAR", "")
 
@@ -232,43 +232,26 @@ func main() {
 
 // getTargetsForJob fetches all unique 'target' labels for a given 'job' from Prometheus/VictoriaMetrics.
 // If targetFilter is not empty, it returns only that target if found.
+// This function now uses api.LabelValues which queries the /api/v1/label/<label_name>/values endpoint,
+// which is more reliable for getting label values in VictoriaMetrics than raw PromQL label_values().
 func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, targetFilter string) ([]string, error) {
-	// Query for unique target labels under the given job
-	// Using a regex match to find any probe_success metrics with the job label
-	query := fmt.Sprintf(`label_values(probe_success{job="%s"}, target)`, job)
-	result, warnings, err := api.Query(ctx, query, time.Now())
+	// Selector to filter probe_success metrics belonging to the specific job
+	// This matches the format expected by the `matches` argument of LabelValues
+	selector := fmt.Sprintf(`{__name__="probe_success", job="%s"}`, job)
+
+	// Call the LabelValues method for the "target" label
+	// It returns a slice of model.LabelValue
+	values, warnings, err := api.LabelValues(ctx, "target", []string{selector})
 	if err != nil {
-		return nil, fmt.Errorf("error querying labels: %w", err)
+		return nil, fmt.Errorf("error querying label values for 'target' with selector '%s': %w", selector, err)
 	}
 	if len(warnings) > 0 {
-		fmt.Printf("Warnings from label query: %v\n", warnings)
+		fmt.Printf("Warnings from LabelValues query: %v\n", warnings)
 	}
 
-	targets := []string{}
-	if vector, ok := result.(model.Vector); ok {
-		for _, sample := range vector {
-			targetLabel := string(sample.Metric["__name__"]) // In label_values result, the value is in __name__
-			if targetLabel != "" {
-				targets = append(targets, targetLabel)
-			}
-		}
-	} else if matrix, ok := result.(model.Matrix); ok {
-		// This can happen if label_values returns a matrix with one-element vectors.
-		// Iterate through the matrix, then through the vector within.
-		for _, series := range matrix {
-			if len(series.Values) > 0 {
-				targetLabel := string(series.Metric["__name__"])
-				if targetLabel != "" {
-					targets = append(targets, targetLabel)
-				}
-			}
-		}
-	} else if scalar, ok := result.(*model.Scalar); ok {
-        // Handle cases where label_values might return a scalar if only one value exists.
-        // This is less common for label_values but good to be robust.
-        targets = append(targets, scalar.String())
-    } else {
-		return nil, fmt.Errorf("unexpected result type for label_values query: %T", result)
+	var targets []string
+	for _, val := range values {
+		targets = append(targets, string(val))
 	}
 
 	// Filter targets if a specific target is requested
@@ -288,17 +271,10 @@ func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, tar
 		return filteredTargets, nil
 	}
 
-	// If no filter, return all unique targets
-	sort.Strings(targets) // Sort for consistent output
-	uniqueTargets := make([]string, 0, len(targets))
-	seen := make(map[string]bool)
-	for _, t := range targets {
-		if _, ok := seen[t]; !ok {
-			seen[t] = true
-			uniqueTargets = append(uniqueTargets, t)
-		}
-	}
-	return uniqueTargets, nil
+	// If no filter, return all unique targets.
+	// LabelValues should typically return unique values already, but sorting is good practice.
+	sort.Strings(targets)
+	return targets, nil // No need for explicit unique check via map, LabelValues should handle it
 }
 
 
@@ -308,22 +284,24 @@ func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map
 	var sb strings.Builder
 	timestamp := time.Now().UnixNano() // Use current time for the push
 
-	// Construct common labels string
+	// Construct common labels string for InfluxDB Line Protocol
+	// Tags are key=value,key2=value2
 	var commonLabelsBuilder strings.Builder
+	firstLabel := true
 	for k, v := range commonLabels {
-		if commonLabelsBuilder.Len() > 0 {
+		if !firstLabel {
 			commonLabelsBuilder.WriteString(",")
 		}
-		commonLabelsBuilder.WriteString(fmt.Sprintf("%s=%s", k, escapeInfluxQL(v)))
+		commonLabelsBuilder.WriteString(fmt.Sprintf("%s=%s", escapeInfluxQLTagKey(k), escapeInfluxQLTagValue(v)))
+		firstLabel = false
 	}
 	commonLabelsStr := commonLabelsBuilder.String()
 
 	for name, value := range metrics {
 		metricName := prefix + name
 		// InfluxDB line protocol format: <measurement>,<tag_key>=<tag_value> <field_key>=<field_value> <timestamp>
-		// For VictoriaMetrics /write, it prefers Prometheus remote_write format or InfluxDB line protocol.
-		// Using InfluxDB line protocol for simplicity here.
-		sb.WriteString(fmt.Sprintf("%s", escapeInfluxQL(metricName))) // Measurement
+		// Example: calc_be_availability_percent,job=blackbox,target=http://service-a.com value=99.99 1700000000000000000
+		sb.WriteString(fmt.Sprintf("%s", escapeInfluxQLMeasurement(metricName))) // Measurement
 		if commonLabelsStr != "" {
 			sb.WriteString(fmt.Sprintf(",%s", commonLabelsStr)) // Tags
 		}
@@ -354,21 +332,28 @@ func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map
 	}
 }
 
-// escapeInfluxQL escapes special characters for InfluxDB Line Protocol.
-func escapeInfluxQL(s string) string {
-    // For tag values: comma, space, and double quotes must be escaped.
-    // For measurement/field keys: comma, space, equals sign must be escaped.
-    // We are using it for measurement (metricName) and tag values.
-    // Replace commas and spaces with backslash-escaped versions.
+// escapeInfluxQLMeasurement escapes special characters for InfluxDB Line Protocol measurement names.
+func escapeInfluxQLMeasurement(s string) string {
     s = strings.ReplaceAll(s, ",", "\\,")
     s = strings.ReplaceAll(s, " ", "\\ ")
-    // Double quotes are not typically escaped in tag values if they don't contain other special chars,
-    // but better to be safe. For metric names, they are not usually present.
-    // If you expect double quotes inside your target labels, you might need:
-    // s = strings.ReplaceAll(s, "\"", "\\\"")
     return s
 }
 
+// escapeInfluxQLTagKey escapes special characters for InfluxDB Line Protocol tag keys.
+func escapeInfluxQLTagKey(s string) string {
+    s = strings.ReplaceAll(s, ",", "\\,")
+    s = strings.ReplaceAll(s, " ", "\\ ")
+    s = strings.ReplaceAll(s, "=", "\\=")
+    return s
+}
+
+// escapeInfluxQLTagValue escapes special characters for InfluxDB Line Protocol tag values.
+func escapeInfluxQLTagValue(s string) string {
+    s = strings.ReplaceAll(s, ",", "\\,")
+    s = strings.ReplaceAll(s, " ", "\\ ")
+    s = strings.ReplaceAll(s, "\"", "\\\"") // Escape double quotes within values
+    return s
+}
 
 // calculateAvailability calculates the overall availability percentage.
 // It counts successful probes and divides by total probes.
