@@ -6,13 +6,8 @@ import (
 	"os"
 	"time"
 
-<<<<<<< HEAD
-	"github.com/prometheus/client_golang/api/prometheus"       // <--- Add this back for NewClient
-	v1 "github.com/prometheus/client_golang/api/prometheus/v1" // This is for the API v1 client
-=======
-	prometheusClient "github.com/prometheus/client_golang/api"        // Correct import for NewClient and Config
+	prometheusClient "github.com/prometheus/client_golang/api"           // Correct import for NewClient and Config
 	prometheusV1 "github.com/prometheus/client_golang/api/prometheus/v1" // Correct import for v1 API
->>>>>>> b63beca2a6a36e103c2e2278a7b21363f487131b
 	"github.com/prometheus/common/model"
 )
 
@@ -22,14 +17,7 @@ const (
 	defaultTargetValue       = "http://example.com"
 	defaultAggregationPeriod = 1 * time.Minute
 	defaultQueryStep         = 2 * time.Hour
-<<<<<<< HEAD
-	// Default range for queries (e.g., for sum_over_time and increase)
-	// This should cover the full month effectively.
-	// We'll calculate it dynamically based on the start and end time of the month.
-	defaultQueryRange = "24h"
-=======
 	defaultQueryRange        = "24h"
->>>>>>> b63beca2a6a36e103c2e2278a7b21363f487131b
 )
 
 // MetricResult represents a single calculated metric value for a specific time
