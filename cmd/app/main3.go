@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strings"
 	"strconv" // Добавлен, если еще не был
+	"strings"
 	"time"
 
 	prometheusClient "github.com/prometheus/client_golang/api"
@@ -16,18 +16,18 @@ import (
 	"github.com/prometheus/common/model"
 
 	// НОВЫЕ ИМПОРТЫ для Prometheus remote_write
+	"github.com/golang/protobuf/proto"        // <- ИСПРАВЛЕНО: используем старую библиотеку protobuf для совместимости с prompb
 	"github.com/golang/snappy"                // Для Snappy-сжатия
 	"github.com/prometheus/prometheus/prompb" // Для структур Prometheus remote_write (protobuf)
-	"github.com/golang/protobuf/proto"        // <- ИСПРАВЛЕНО: используем старую библиотеку protobuf для совместимости с prompb
 )
 
 const (
-	defaultPrometheusURL     = "http://localhost:8428"
-	defaultPrometheusURLIn   = "" // Default empty, meaning no output
-	defaultJobName           = "blackbox"
-	defaultMetricPrefix      = "calc_be_"
-	defaultScrapeInterval    = 1 * time.Minute // Assumed blackbox_exporter scrape interval
-	defaultQueryStep         = 12 * time.Hour  // Chunk size for fetching data from Prometheus/VictoriaMetrics
+	defaultPrometheusURL   = "http://localhost:8428"
+	defaultPrometheusURLIn = "" // Default empty, meaning no output
+	defaultJobName         = "blackbox"
+	defaultMetricPrefix    = "calc_be_"
+	defaultScrapeInterval  = 1 * time.Minute // Assumed blackbox_exporter scrape interval
+	defaultQueryStep       = 12 * time.Hour  // Chunk size for fetching data from Prometheus/VictoriaMetrics
 )
 
 // SamplePair represents a single time series data point (timestamp and value)
@@ -281,7 +281,6 @@ func getTargetsForJob(ctx context.Context, api prometheusV1.API, job string, tar
 	return targets, nil
 }
 
-
 // sendMetrics pushes calculated metrics to a Prometheus remote_write compatible endpoint
 // using Prometheus remote_write protocol (Protobuf + Snappy compression).
 func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map[string]float64) {
@@ -289,7 +288,7 @@ func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map
 
 	for name, value := range metrics {
 		metricName := prefix + name
-		
+
 		// Создаем лейблы для TimeSeries
 		// "__name__" - это специальный лейбл для имени метрики в Prometheus
 		labels := []prompb.Label{
@@ -299,7 +298,7 @@ func sendMetrics(url, prefix string, commonLabels map[string]string, metrics map
 		for k, v := range commonLabels {
 			labels = append(labels, prompb.Label{Name: k, Value: v})
 		}
-		
+
 		// Создаем сэмпл
 		// Timestamp должен быть в миллисекундах Unix
 		sample := prompb.Sample{
